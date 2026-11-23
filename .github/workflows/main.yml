@@ -1,0 +1,7 @@
+      - name: Upload Artifact
+        id: dopamine-latest-upload
+        uses: actions/upload-artifact@main
+        with:
+          name: Dopamine
+          path: |
+            ${{ github.workspace }}/Application/Dopamine.ipa
