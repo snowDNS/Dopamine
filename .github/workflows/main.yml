@@ -1,7 +1,138 @@
-      - name: Upload Artifact
-        id: dopamine-latest-upload
-        uses: actions/upload-artifact@main
+
+name: StarJail - build from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '*.zip'
+      - '.github/workflows/main.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: starjail-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract StarJail ZIP automatically
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' -print -quit)"
+          if [[ -z "$ZIP_FILE" ]]; then
+            echo 'Nu am găsit niciun fișier ZIP în rădăcina repository-ului.' >&2
+            exit 1
+          fi
+          echo "Arhivă găsită: $(basename "$ZIP_FILE")"
+          mkdir -p "$RUNNER_TEMP/starjail-extracted"
+          ditto -x -k "$ZIP_FILE" "$RUNNER_TEMP/starjail-extracted"
+          PROJECT_MAKEFILE="$(find "$RUNNER_TEMP/starjail-extracted" -mindepth 2 -maxdepth 2 -type f -name Makefile -print -quit)"
+          if [[ -z "$PROJECT_MAKEFILE" ]]; then
+            echo 'Arhiva nu conține Makefile la rădăcina proiectului.' >&2
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$PROJECT_MAKEFILE")"
+          rsync -a --exclude='.github/' "$PROJECT_DIR/" "$GITHUB_WORKSPACE/"
+          test -f "$GITHUB_WORKSPACE/.gitmodules"
+          test -d "$GITHUB_WORKSPACE/Application"
+
+      - name: Fetch source submodules listed in .gitmodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r key path; do
+            name="${key%.path}"
+            url="$(git config -f .gitmodules "$name.url")"
+            if [[ -z "$url" ]]; then
+              echo "Lipsește URL-ul pentru submodulul $name" >&2
+              exit 1
+            fi
+            mkdir -p "$(dirname "$path")"
+            if [[ ! -d "$path/.git" ]]; then
+              rm -rf "$path"
+              git clone --depth 1 --recurse-submodules "$url" "$path"
+            fi
+          done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
         with:
-          name: Dopamine
-          path: |
-            ${{ github.workspace }}/Application/Dopamine.ipa
+          xcode-version: latest-stable
+
+      - name: Install Procursus tools
+        uses: dhinakg/procursus-action@main
+        with:
+          packages: ldid findutils sed coreutils make
+
+      - name: Install GNU Make
+        run: |
+          brew install make
+          echo "PATH=$(brew --prefix make)/libexec/gnubin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install THEOS and iOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BASEDIR="$GITHUB_WORKSPACE"
+          export THEOS="$BASEDIR/theos"
+          mkdir -p "$THEOS"
+          curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos -o install-theos.sh
+          gsed -E '/^\s*get_theos\s*$/,+1 s/^(\s*)(get_sdks)\s*$/\1mkdir -p ${THEOS}\/sdks\n\1touch ${THEOS}\/sdks\/sdk\n\1\2/g' -i install-theos.sh
+          bash install-theos.sh
+          curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          tar -xJf "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          rm "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+
+      - name: Build and install trustcache
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/CRKatri/trustcache "$RUNNER_TEMP/trustcache"
+          cd "$RUNNER_TEMP/trustcache"
+          export CFLAGS="${CFLAGS:-} -I$(brew --prefix openssl)/include -arch arm64"
+          export LDFLAGS="${LDFLAGS:-} -L$(brew --prefix openssl)/lib -arch arm64"
+          gmake -j"$(sysctl -n hw.logicalcpu)" OPENSSL=1
+          sudo cp trustcache /opt/procursus/bin/
+
+      - name: Set build variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          T2=$(TZ=UTC-2 date +'%Y%m%d_%H%M%S')
+          TS=$(date -j -f '%Y%m%d_%H%M%S' "$T2" +%s)
+          SHASH=$(git rev-parse --short HEAD)
+          echo "ctime=$T2" >> "$GITHUB_ENV"
+          echo "ctimestamp=$TS" >> "$GITHUB_ENV"
+          echo "shorthash=$SHASH" >> "$GITHUB_ENV"
+
+      - name: Install libarchive
+        run: brew install libarchive
+
+      - name: Download bootstraps
+        working-directory: Application/Dopamine/Resources
+        run: ./download_bootstraps.sh
+
+      - name: Build StarJail
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BASEDIR="$GITHUB_WORKSPACE"
+          export THEOS="$BASEDIR/theos"
+          gmake -j"$(sysctl -n hw.logicalcpu)" NIGHTLY=1
+
+      - name: Upload StarJail IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarJail-IPA
+          path: Application/Dopamine.ipa
+          if-no-files-found: error
+          retention-days: 14
